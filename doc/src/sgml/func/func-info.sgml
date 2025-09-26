@@ -3797,4 +3797,48 @@ acl      | {postgres=arwdDxtm/postgres,foo=r/postgres}
 
   </sect2>
 
+  <sect2 id="functions-info-retail">
+   <title>DDL Retail Functions</title>
+
+   <para>
+    <xref linkend="functions-info-retail-table"/> lists functions that
+    extract information about ....
+   </para>
+
+   <table id="functions-info-retail-table">
+    <title>DDL Retail Functions</title>
+    <tgroup cols="1">
+     <thead>
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        Function
+       </para>
+       <para>
+        Description
+       </para></entry>
+      </row>
+     </thead>
+
+     <tbody>
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <indexterm>
+         <primary>pg_get_event_trigger_ddl</primary>
+        </indexterm>
+        <function>pg_get_event_trigger_ddl</function>
+        ( <parameter>event_trigger_name</parameter> <type>name</type> )
+        <returnvalue>text</returnvalue>
+       </para>
+       <para>
+        Reconstructs the underlying DDL statement for a specified event trigger.
+        It returns the complete <command>CREATE EVENT TRIGGER</command> statement. If
+        the event trigger does not exist, an error is raised.
+       </para></entry>
+      </row>
+     </tbody>
+    </tgroup>
+   </table>
+
+  </sect2>
+
   </sect1>

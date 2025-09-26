@@ -85,6 +85,16 @@ create event trigger regress_event_trigger2 on ddl_command_start
 -- OK
 comment on event trigger regress_event_trigger is 'test comment';
 
+-- these are all OK - checks the DDL output without a tag filter and with one
+SELECT pg_get_event_trigger_ddl('regress_event_trigger');
+SELECT pg_get_event_trigger_ddl('regress_event_trigger2');
+
+-- will return NULL
+SELECT pg_get_event_trigger_ddl(NULL);
+
+-- should fail, no argument
+SELECT pg_get_event_trigger_ddl();
+
 -- drop as non-superuser should fail
 create role regress_evt_user;
 set role regress_evt_user;

@@ -84,6 +84,32 @@ create event trigger regress_event_trigger2 on ddl_command_start
    execute procedure test_event_trigger();
 -- OK
 comment on event trigger regress_event_trigger is 'test comment';
+-- these are all OK - checks the DDL output without a tag filter and with one
+SELECT pg_get_event_trigger_ddl('regress_event_trigger');
+                                           pg_get_event_trigger_ddl                                            
+---------------------------------------------------------------------------------------------------------------
+ CREATE EVENT TRIGGER regress_event_trigger ON ddl_command_start EXECUTE FUNCTION public.test_event_trigger();
+(1 row)
+
+SELECT pg_get_event_trigger_ddl('regress_event_trigger2');
+                                                                   pg_get_event_trigger_ddl                                                                    
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+ CREATE EVENT TRIGGER regress_event_trigger2 ON ddl_command_start WHEN TAG IN ('CREATE TABLE','CREATE FUNCTION') EXECUTE FUNCTION public.test_event_trigger();
+(1 row)
+
+-- will return NULL
+SELECT pg_get_event_trigger_ddl(NULL);
+ pg_get_event_trigger_ddl 
+--------------------------
+ 
+(1 row)
+
+-- should fail, no argument
+SELECT pg_get_event_trigger_ddl();
+ERROR:  function pg_get_event_trigger_ddl() does not exist
+LINE 1: SELECT pg_get_event_trigger_ddl();
+               ^
+DETAIL:  No function of that name accepts the given number of arguments.
 -- drop as non-superuser should fail
 create role regress_evt_user;
 set role regress_evt_user;
