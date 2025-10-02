@@ -1163,6 +1163,42 @@ pg_get_triggerdef_worker(Oid trigid, bool pretty)
 }
 
 /* ----------
+ * pg_get_trigger_ddl - Get the DDL statement for a trigger
+ * ----------
+ */
+Datum
+pg_get_trigger_ddl(PG_FUNCTION_ARGS)
+{
+	Name			trgName;
+	Oid				reloid;
+	Oid				tgoid;
+	HeapTuple		tgTup;
+	Form_pg_trigger trigForm;
+	char			*triggername;
+	StringInfoData 	buf;
+
+	trgName = PG_GETARG_NAME(0);
+
+	tgTup = SearchSysCache1(TRIGGEROID, NameGetDatum(trgName));
+	if (!HeapTupleIsValid(tgTup))
+		ereport(ERROR,
+			(errcode(ERRCODE_UNDEFINED_OBJECT), 
+			errmsg("trigger \"%s\" does not exist", NameStr(*trgName))));
+
+	trigForm = (Form_pg_trigger) GETSTRUCT(tgTup);
+	triggername = NameStr(trigForm->tgname);
+
+	/* Build the trigger definition */
+	initStringInfo(&buf);
+
+	appendStringInfo(&buf, "CREATE TRIGGER %s ", triggername);
+	
+	ReleaseSysCache(tgTup);
+	PG_RETURN_TEXT_P(string_to_text(buf.data));
+	
+}
+
+/* ----------
  * pg_get_indexdef			- Get the definition of an index
  *
  * In the extended version, there is a colno argument as well as pretty bool.
