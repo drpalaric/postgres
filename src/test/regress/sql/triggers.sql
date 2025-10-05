@@ -192,6 +192,30 @@ SELECT pg_get_triggerdef(oid, true) FROM pg_trigger WHERE tgrelid = 'main_table'
 SELECT pg_get_triggerdef(oid, false) FROM pg_trigger WHERE tgrelid = 'main_table'::regclass AND tgname = 'modified_a';
 SELECT pg_get_triggerdef(oid, true) FROM pg_trigger WHERE tgrelid = 'main_table'::regclass AND tgname = 'modified_any';
 
+-- Test the output of the pg_get_trigger_ddl(table_name, trigger_name) function with WHEN clauses.
+SELECT pg_get_trigger_ddl('main_table', 'modified_a');
+SELECT pg_get_trigger_ddl('main_table', 'modified_any');
+SELECT pg_get_trigger_ddl('main_table', 'insert_a');
+SELECT pg_get_trigger_ddl('main_table', 'delete_a');
+SELECT pg_get_trigger_ddl('main_table', 'insert_when');
+SELECT pg_get_trigger_ddl('main_table', 'delete_when');
+
+-- Test the output of the pg_get_trigger_ddl(table_name, trigger_name) function for CONSTRAINT triggers.
+CREATE CONSTRAINT TRIGGER constraint_trig AFTER INSERT ON main_table
+  DEFERRABLE
+  FOR EACH ROW EXECUTE PROCEDURE trigger_func('modified_a');
+SELECT pg_get_trigger_ddl('main_table', 'constraint_trig');
+DROP TRIGGER constraint_trig ON main_table;
+
+-- Test the output of the pg_get_trigger_ddl(table_name, trigger_name) function with NULL cases.
+SELECT pg_get_trigger_ddl(NULL, 'delete_when');
+SELECT pg_get_trigger_ddl('main_table', NULL);
+SELECT pg_get_trigger_ddl(NULL, NULL);
+
+-- Fail. Test the output of the pg_get_trigger_ddl(table_name, trigger_name) function for ERROR cases.
+SELECT pg_get_trigger_ddl('main_table', 'no_such_trigger');
+SELECT pg_get_trigger_ddl('no_such_table', 'modified_a');
+
 -- Test RENAME TRIGGER
 ALTER TRIGGER modified_a ON main_table RENAME TO modified_modified_a;
 SELECT count(*) FROM pg_trigger WHERE tgrelid = 'main_table'::regclass AND tgname = 'modified_a';

@@ -1164,38 +1164,34 @@ pg_get_triggerdef_worker(Oid trigid, bool pretty)
 
 /* ----------
  * pg_get_trigger_ddl - Get the DDL statement for a trigger
+ *
+ * This function retrieves the DDL statement for a specified trigger given a
+ * table name and trigger name. It uses the pg_get_triggerdef_worker function
+ * to perform the actual retrieval of the DDL statement. This function allows
+ * users to obtain the DDL definition of a trigger in a convenient manner using
+ * the trigger's name and the table it belongs to, rather than having to
+ * look up the trigger OID first to obtain the definition.
  * ----------
  */
 Datum
 pg_get_trigger_ddl(PG_FUNCTION_ARGS)
 {
-	Name			trgName;
-	Oid				reloid;
-	Oid				tgoid;
-	HeapTuple		tgTup;
-	Form_pg_trigger trigForm;
-	char			*triggername;
-	StringInfoData 	buf;
+	Oid     relid;
+	Name    trgName;
+	Oid     trgOid;
+	char   	*res;
 
-	trgName = PG_GETARG_NAME(0);
+	/* Get the table name and trigger name */
+    relid   = PG_GETARG_OID(0);
+	trgName = PG_GETARG_NAME(1);
 
-	tgTup = SearchSysCache1(TRIGGEROID, NameGetDatum(trgName));
-	if (!HeapTupleIsValid(tgTup))
-		ereport(ERROR,
-			(errcode(ERRCODE_UNDEFINED_OBJECT), 
-			errmsg("trigger \"%s\" does not exist", NameStr(*trgName))));
+	/* Resolve trigger OID */
+	trgOid = get_trigger_oid(relid, NameStr(*trgName), false);
 
-	trigForm = (Form_pg_trigger) GETSTRUCT(tgTup);
-	triggername = NameStr(trigForm->tgname);
+	/* Use the existing backend function to reconstruct the CREATE TRIGGER */
+	res = pg_get_triggerdef_worker(trgOid, false);
 
-	/* Build the trigger definition */
-	initStringInfo(&buf);
-
-	appendStringInfo(&buf, "CREATE TRIGGER %s ", triggername);
-	
-	ReleaseSysCache(tgTup);
-	PG_RETURN_TEXT_P(string_to_text(buf.data));
-	
+	PG_RETURN_TEXT_P(string_to_text(res));
 }
 
 /* ----------

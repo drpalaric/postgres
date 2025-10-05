@@ -8549,7 +8549,7 @@
   proargtypes => 'oid bool', prosrc => 'pg_get_triggerdef_ext' },
 { oid => '9569', descr => 'get CREATE statement for a trigger',
   proname => 'pg_get_trigger_ddl', proisstrict => 't', prorettype => 'text',
-  proargtypes => 'name', prosrc => 'pg_get_trigger_ddl' },  
+  proargtypes => 'regclass name', prosrc => 'pg_get_trigger_ddl' },  
 
 # asynchronous notifications
 { oid => '3035',
