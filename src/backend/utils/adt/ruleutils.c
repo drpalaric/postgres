@@ -29,11 +29,13 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_depend.h"
+#include "catalog/pg_enum.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_partitioned_table.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_range.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
@@ -353,6 +355,7 @@ static char *deparse_expression_pretty(Node *expr, List *dpcontext,
 static char *pg_get_viewdef_worker(Oid viewoid,
 								   int prettyFlags, int wrapColumn);
 static char *pg_get_triggerdef_worker(Oid trigid, bool pretty);
+static char *pg_get_typedef_worker(Oid typeid, bool pretty);
 static int	decompile_column_index_array(Datum column_index_array, Oid relId,
 										 bool withPeriod, StringInfo buf);
 static char *pg_get_ruledef_worker(Oid ruleoid, int prettyFlags);
@@ -373,6 +376,10 @@ static int	print_function_arguments(StringInfo buf, HeapTuple proctup,
 static void print_function_rettype(StringInfo buf, HeapTuple proctup);
 static void print_function_trftypes(StringInfo buf, HeapTuple proctup);
 static void print_function_sqlbody(StringInfo buf, HeapTuple proctup);
+static void print_composite_type_def(StringInfo buf, Form_pg_type typ, Oid typeid, int prettyFlags);
+static void print_enum_type_def(StringInfo buf, Oid typeid, int prettyFlags);
+static void print_range_type_def(StringInfo buf, Oid typeid, int prettyFlags);
+static void print_base_type_def(StringInfo buf, Form_pg_type typ, HeapTuple typeTup, int prettyFlags);
 static void set_rtable_names(deparse_namespace *dpns, List *parent_namespaces,
 							 Bitmapset *rels_used);
 static void set_deparse_for_query(deparse_namespace *dpns, Query *query,
@@ -2909,6 +2916,649 @@ pg_get_serial_sequence(PG_FUNCTION_ARGS)
 	}
 
 	PG_RETURN_NULL();
+}
+
+/*
+ * pg_get_typedef
+ *		Returns the complete "CREATE TYPE ..." statement for
+ *		the specified type.
+ *
+ *		Output is formatted on a single line with schema qualifiers.
+ */
+Datum
+pg_get_typedef(PG_FUNCTION_ARGS)
+{
+	Oid			typeid = PG_GETARG_OID(0);
+	char	   *res;
+
+	res = pg_get_typedef_worker(typeid, false);
+
+	if (res == NULL)
+		PG_RETURN_NULL();
+
+	PG_RETURN_TEXT_P(string_to_text(res));
+}
+
+Datum
+pg_get_typedef_ext(PG_FUNCTION_ARGS)
+{
+	Oid			typeid = PG_GETARG_OID(0);
+	bool		pretty = PG_GETARG_BOOL(1);
+	char	   *res;
+
+	res = pg_get_typedef_worker(typeid, pretty);
+
+	if (res == NULL)
+		PG_RETURN_NULL();
+
+	PG_RETURN_TEXT_P(string_to_text(res));
+}
+
+static char *
+pg_get_typedef_worker(Oid typeid, bool pretty)
+{
+	HeapTuple		typeTup;
+	Form_pg_type 	typ;
+	char	   		*nspname;
+	StringInfoData 	buf;
+	char			typtype;
+	int				prettyFlags;
+
+	/* Convert pretty bool to prettyFlags */
+	/* When pretty=true: indent without schema. When pretty=false: schema without indent */
+	prettyFlags = pretty ? PRETTYFLAG_INDENT : PRETTYFLAG_SCHEMA;
+
+	/* Look up the type */
+	typeTup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typeid));
+	if (!HeapTupleIsValid(typeTup))
+		return NULL;
+
+	typ = (Form_pg_type) GETSTRUCT(typeTup);
+	typtype = typ->typtype;
+
+	/* Get the namespace name */
+	nspname = get_namespace_name(typ->typnamespace);
+
+	initStringInfo(&buf);
+
+	/* Build CREATE TYPE statement with qualified type name */
+	appendStringInfo(&buf, "CREATE TYPE %s",
+					 (prettyFlags & PRETTYFLAG_SCHEMA) ?
+					 quote_qualified_identifier(nspname, NameStr(typ->typname)) :
+					 quote_identifier(NameStr(typ->typname)));
+
+	/* Generate type definition based on type kind */
+	switch (typtype)
+	{
+		case TYPTYPE_COMPOSITE:
+			/* Composite type (row type) */
+			print_composite_type_def(&buf, typ, typeid, prettyFlags);
+			break;
+
+		case TYPTYPE_ENUM:
+			/* Enum type */
+			print_enum_type_def(&buf, typeid, prettyFlags);
+			break;
+
+		case TYPTYPE_RANGE:
+			/* Range type */
+			print_range_type_def(&buf, typeid, prettyFlags);
+			break;
+
+		case TYPTYPE_BASE:
+			/* Base type */
+			print_base_type_def(&buf, typ, typeTup, prettyFlags);
+			break;
+
+		case TYPTYPE_DOMAIN:
+			/* Domain types not supported */
+			ReleaseSysCache(typeTup);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("domain types are not supported")));
+			break;
+
+		case TYPTYPE_PSEUDO:
+			/* Pseudo types not supported */
+			ReleaseSysCache(typeTup);
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot get definition of pseudo-type")));
+			break;
+
+		default:
+			/* Shell types and others */
+			break;
+	}
+
+	ReleaseSysCache(typeTup);
+
+	return buf.data;
+}
+
+/*
+ * print_composite_type_def
+ *		Append the definition of a composite type to buf.
+ */
+static void
+print_composite_type_def(StringInfo buf, Form_pg_type typ, Oid typeid, int prettyFlags)
+{
+	Relation	rel;
+	TupleDesc	tupdesc;
+	int			i;
+	bool		first = true;
+	deparse_context context;
+
+	if (!OidIsValid(typ->typrelid))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 errmsg("composite type \"%s\" has no associated relation",
+						format_type_be(typeid))));
+
+	rel = relation_open(typ->typrelid, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
+
+	/* Set up a minimal deparse context for appendContextKeyword */
+	memset(&context, 0, sizeof(deparse_context));
+	context.buf = buf;
+	context.prettyFlags = prettyFlags;
+	context.indentLevel = 0;
+	context.wrapColumn = WRAP_COLUMN_DEFAULT;
+
+	appendContextKeyword(&context, " AS (", 0, 0, PRETTYINDENT_STD);
+
+	/* Loop through each column of the composite type */
+	for (i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+		if (attr->attisdropped)
+			continue;
+
+		/* Add comma separator between columns */
+		if (!first)
+			appendContextKeyword(&context, ", ", 0, 0, 0);
+		first = false;
+
+		/* Output column name and type */
+		appendStringInfo(buf, "%s %s",
+						 quote_identifier(NameStr(attr->attname)),
+						 format_type_with_typemod(attr->atttypid,
+												  attr->atttypmod));
+
+		/* Output COLLATE clause if there is a different collation than the default */
+		if (attr->attcollation != InvalidOid &&
+			attr->attcollation != get_typcollation(attr->atttypid))
+			appendStringInfo(buf, " COLLATE %s",
+							 generate_collation_name(attr->attcollation));
+	}
+
+	appendContextKeyword(&context, " )", -PRETTYINDENT_STD, 0, 0);
+	relation_close(rel, AccessShareLock);
+}
+
+/*
+ * print_enum_type_def
+ *		Append the definition of an enum type to buf.
+ */
+static void
+print_enum_type_def(StringInfo buf, Oid typeid, int prettyFlags)
+{
+	Relation	enumRel;
+	SysScanDesc enumScan;
+	HeapTuple	enumTuple;
+	ScanKeyData skey;
+	bool		first = true;
+	deparse_context context;
+
+	/* Set up a minimal deparse context for appendContextKeyword */
+	memset(&context, 0, sizeof(deparse_context));
+	context.buf = buf;
+	context.prettyFlags = prettyFlags;
+	context.indentLevel = 0;
+	context.wrapColumn = WRAP_COLUMN_DEFAULT;
+
+	appendContextKeyword(&context, " AS ENUM (", 0, 0, PRETTYINDENT_STD);
+
+	ScanKeyInit(&skey,
+				Anum_pg_enum_enumtypid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(typeid));
+
+	enumRel = table_open(EnumRelationId, AccessShareLock);
+	enumScan = systable_beginscan(enumRel, EnumTypIdSortOrderIndexId, true,
+									NULL, 1, &skey);
+
+	while (HeapTupleIsValid(enumTuple = systable_getnext(enumScan)))
+	{
+		Form_pg_enum en = (Form_pg_enum) GETSTRUCT(enumTuple);
+
+		/* Add comma separator between enum values */
+		if (!first)
+			appendContextKeyword(&context, ", ", 0, 0, 0);
+		first = false;
+
+		appendStringInfo(buf, "%s",
+						quote_literal_cstr(NameStr(en->enumlabel)));
+	}
+
+	systable_endscan(enumScan);
+	table_close(enumRel, AccessShareLock);
+
+	appendContextKeyword(&context, " )", -PRETTYINDENT_STD, 0, 0);
+}
+
+/*
+ * print_range_type_def
+ *		Append the definition of a range type to buf.
+ */
+static void
+print_range_type_def(StringInfo buf, Oid typeid, int prettyFlags)
+{
+	HeapTuple		rngTup;
+	Form_pg_range	rng;
+	Oid				subtype;
+	Oid				subopc;
+	Oid				collation;
+	Oid				canonical;
+	Oid				subdiff;
+	Oid				multirange;
+	HeapTuple		funcTup;
+	Form_pg_proc	funcForm;
+	char		   	*funcNsp;
+	deparse_context context;
+
+	rngTup = SearchSysCache1(RANGETYPE, ObjectIdGetDatum(typeid));
+	if (!HeapTupleIsValid(rngTup))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 errmsg("range type \"%s\" has no pg_range entry",
+						format_type_be(typeid))));
+
+	rng = (Form_pg_range) GETSTRUCT(rngTup);
+
+	subtype = rng->rngsubtype;
+	subopc = rng->rngsubopc;
+	collation = rng->rngcollation;
+	canonical = rng->rngcanonical;
+	subdiff = rng->rngsubdiff;
+	multirange = rng->rngmultitypid;
+
+	/* Set up a minimal deparse context for appendContextKeyword */
+	memset(&context, 0, sizeof(deparse_context));
+	context.buf = buf;
+	context.prettyFlags = prettyFlags;
+	context.indentLevel = 0;
+	context.wrapColumn = WRAP_COLUMN_DEFAULT;
+
+	appendStringInfo(buf, " AS RANGE (");
+	appendContextKeyword(&context, "", 0, 0, PRETTYINDENT_STD);
+	appendStringInfo(buf, "SUBTYPE = %s", format_type_be(subtype));
+
+	/* Range type parameters */
+
+	/* Add SUBTYPE_OPCLASS if a specific operator class is defined */
+	if (OidIsValid(subopc))
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, PRETTYINDENT_STD);
+		appendStringInfoString(buf, "SUBTYPE_OPCLASS = ");
+		get_opclass_name(subopc, InvalidOid, buf);
+	}
+
+	/* Add COLLATION if the range type uses a non-default collation */
+	if (OidIsValid(collation))
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, PRETTYINDENT_STD);
+		appendStringInfo(buf, "COLLATION = %s",
+						generate_collation_name(collation));
+	}
+
+	/* Add CANONICAL and SUBTYPE_DIFF functions if defined */
+	if (OidIsValid(canonical))
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, PRETTYINDENT_STD);
+		funcTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(canonical));
+		if (!HeapTupleIsValid(funcTup))
+			elog(ERROR, "cache lookup failed for function %u", canonical);
+
+		funcForm = (Form_pg_proc) GETSTRUCT(funcTup);
+		funcNsp = get_namespace_name(funcForm->pronamespace);
+
+		appendStringInfo(buf, "CANONICAL = %s",
+						quote_qualified_identifier(funcNsp,
+												   NameStr(funcForm->proname)));
+		ReleaseSysCache(funcTup);
+	}
+
+	if (OidIsValid(subdiff))
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, PRETTYINDENT_STD);
+		funcTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(subdiff));
+		if (!HeapTupleIsValid(funcTup))
+			elog(ERROR, "cache lookup failed for function %u", subdiff);
+
+		funcForm = (Form_pg_proc) GETSTRUCT(funcTup);
+		funcNsp = get_namespace_name(funcForm->pronamespace);
+
+		appendStringInfo(buf, "SUBTYPE_DIFF = %s",
+						quote_qualified_identifier(funcNsp,
+												   NameStr(funcForm->proname)));
+		ReleaseSysCache(funcTup);
+	}
+
+	/* Add MULTIRANGE_TYPE_NAME if a multirange type is associated with this range */
+	if (OidIsValid(multirange))
+	{
+		HeapTuple		multirangeTup;
+		Form_pg_type 	multirangeTyp;
+		char		   *multirangeNspName;
+		const char	   *qualifiedMultirangeName;
+
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, PRETTYINDENT_STD);
+		multirangeTup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(multirange));
+		if (!HeapTupleIsValid(multirangeTup))
+			elog(ERROR, "cache lookup failed for type %u", multirange);
+
+		multirangeTyp = (Form_pg_type) GETSTRUCT(multirangeTup);
+		multirangeNspName = get_namespace_name(multirangeTyp->typnamespace);
+		qualifiedMultirangeName = quote_qualified_identifier(multirangeNspName,
+															 NameStr(multirangeTyp->typname));
+		appendStringInfo(buf, "MULTIRANGE_TYPE_NAME = %s",
+						qualifiedMultirangeName);
+
+		ReleaseSysCache(multirangeTup);
+	}
+
+	appendStringInfoChar(buf, ')');
+	ReleaseSysCache(rngTup);
+}
+
+/*
+ * print_base_type_def
+ *		Append the definition of a base type to buf.
+ */
+static void
+print_base_type_def(StringInfo buf, Form_pg_type typ, HeapTuple typeTup, int prettyFlags)
+{
+	Datum			defaultDatum;
+	bool			isnull;
+	char		   	*defaultValue;
+	HeapTuple		funcTup;
+	Form_pg_proc	funcForm;
+	char		   	*funcNsp;
+	deparse_context context;
+
+	/* Set up a minimal deparse context for appendContextKeyword */
+	memset(&context, 0, sizeof(deparse_context));
+	context.buf = buf;
+	context.prettyFlags = prettyFlags;
+	context.indentLevel = PRETTYINDENT_STD;
+	context.wrapColumn = WRAP_COLUMN_DEFAULT;
+
+	appendStringInfoString(buf, " (");
+
+	/* INPUT function (required) */
+	appendContextKeyword(&context, "", 0, 0, 0);
+	funcTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(typ->typinput));
+	if (!HeapTupleIsValid(funcTup))
+		elog(ERROR, "cache lookup failed for function %u", typ->typinput);
+
+	funcForm = (Form_pg_proc) GETSTRUCT(funcTup);
+	funcNsp = get_namespace_name(funcForm->pronamespace);
+
+	appendStringInfo(buf, "INPUT = %s",
+					(prettyFlags & PRETTYFLAG_SCHEMA) ?
+					quote_qualified_identifier(funcNsp, NameStr(funcForm->proname)) :
+					quote_identifier(NameStr(funcForm->proname)));
+	ReleaseSysCache(funcTup);
+
+	/* OUTPUT function (required) */
+	appendStringInfoString(buf, ", ");
+	appendContextKeyword(&context, "", 0, 0, 0);
+	funcTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(typ->typoutput));
+	if (!HeapTupleIsValid(funcTup))
+		elog(ERROR, "cache lookup failed for function %u", typ->typoutput);
+
+	funcForm = (Form_pg_proc) GETSTRUCT(funcTup);
+	funcNsp = get_namespace_name(funcForm->pronamespace);
+
+	appendStringInfo(buf, "OUTPUT = %s",
+					(prettyFlags & PRETTYFLAG_SCHEMA) ?
+					quote_qualified_identifier(funcNsp, NameStr(funcForm->proname)) :
+					quote_identifier(NameStr(funcForm->proname)));
+	ReleaseSysCache(funcTup);
+
+	/* Optional functions if defined */
+
+	/* RECEIVE function */
+	if (OidIsValid(typ->typreceive))
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, 0);
+		funcTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(typ->typreceive));
+		if (!HeapTupleIsValid(funcTup))
+			elog(ERROR, "cache lookup failed for function %u", typ->typreceive);
+
+		funcForm = (Form_pg_proc) GETSTRUCT(funcTup);
+		funcNsp = get_namespace_name(funcForm->pronamespace);
+
+		appendStringInfo(buf, "RECEIVE = %s",
+						(prettyFlags & PRETTYFLAG_SCHEMA) ?
+						quote_qualified_identifier(funcNsp, NameStr(funcForm->proname)) :
+						quote_identifier(NameStr(funcForm->proname)));
+		ReleaseSysCache(funcTup);
+	}
+
+	/* SEND function */
+	if (OidIsValid(typ->typsend))
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, 0);
+		funcTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(typ->typsend));
+		if (!HeapTupleIsValid(funcTup))
+			elog(ERROR, "cache lookup failed for function %u", typ->typsend);
+
+		funcForm = (Form_pg_proc) GETSTRUCT(funcTup);
+		funcNsp = get_namespace_name(funcForm->pronamespace);
+
+		appendStringInfo(buf, "SEND = %s",
+						(prettyFlags & PRETTYFLAG_SCHEMA) ?
+						quote_qualified_identifier(funcNsp, NameStr(funcForm->proname)) :
+						quote_identifier(NameStr(funcForm->proname)));
+		ReleaseSysCache(funcTup);
+	}
+
+	/* TYPMOD_IN function */
+	if (OidIsValid(typ->typmodin))
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, 0);
+		funcTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(typ->typmodin));
+		if (!HeapTupleIsValid(funcTup))
+			elog(ERROR, "cache lookup failed for function %u", typ->typmodin);
+
+		funcForm = (Form_pg_proc) GETSTRUCT(funcTup);
+		funcNsp = get_namespace_name(funcForm->pronamespace);
+
+		appendStringInfo(buf, "TYPMOD_IN = %s",
+						(prettyFlags & PRETTYFLAG_SCHEMA) ?
+						quote_qualified_identifier(funcNsp, NameStr(funcForm->proname)) :
+						quote_identifier(NameStr(funcForm->proname)));
+		ReleaseSysCache(funcTup);
+	}
+
+	/* TYPMOD_OUT function */
+	if (OidIsValid(typ->typmodout))
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, 0);
+		funcTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(typ->typmodout));
+		if (!HeapTupleIsValid(funcTup))
+			elog(ERROR, "cache lookup failed for function %u", typ->typmodout);
+
+		funcForm = (Form_pg_proc) GETSTRUCT(funcTup);
+		funcNsp = get_namespace_name(funcForm->pronamespace);
+
+		appendStringInfo(buf, "TYPMOD_OUT = %s",
+						(prettyFlags & PRETTYFLAG_SCHEMA) ?
+						quote_qualified_identifier(funcNsp, NameStr(funcForm->proname)) :
+						quote_identifier(NameStr(funcForm->proname)));
+		ReleaseSysCache(funcTup);
+	}
+
+	/* ANALYZE function */
+	if (OidIsValid(typ->typanalyze))
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, 0);
+		funcTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(typ->typanalyze));
+		if (!HeapTupleIsValid(funcTup))
+			elog(ERROR, "cache lookup failed for function %u", typ->typanalyze);
+
+		funcForm = (Form_pg_proc) GETSTRUCT(funcTup);
+		funcNsp = get_namespace_name(funcForm->pronamespace);
+
+		appendStringInfo(buf, "ANALYZE = %s",
+						(prettyFlags & PRETTYFLAG_SCHEMA) ?
+						quote_qualified_identifier(funcNsp, NameStr(funcForm->proname)) :
+						quote_identifier(NameStr(funcForm->proname)));
+		ReleaseSysCache(funcTup);
+	}
+
+	/* SUBSCRIPT function */
+	if (OidIsValid(typ->typsubscript))
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, 0);
+		funcTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(typ->typsubscript));
+		if (!HeapTupleIsValid(funcTup))
+			elog(ERROR, "cache lookup failed for function %u", typ->typsubscript);
+
+		funcForm = (Form_pg_proc) GETSTRUCT(funcTup);
+		funcNsp = get_namespace_name(funcForm->pronamespace);
+
+		appendStringInfo(buf, "SUBSCRIPT = %s",
+						(prettyFlags & PRETTYFLAG_SCHEMA) ?
+						quote_qualified_identifier(funcNsp, NameStr(funcForm->proname)) :
+						quote_identifier(NameStr(funcForm->proname)));
+		ReleaseSysCache(funcTup);
+	}
+
+	/* INTERNALLENGTH */
+	appendStringInfoString(buf, ", ");
+	appendContextKeyword(&context, "", 0, 0, 0);
+	if (typ->typlen == -1)
+		appendStringInfoString(buf, "INTERNALLENGTH = VARIABLE");
+	else
+		appendStringInfo(buf, "INTERNALLENGTH = %d", typ->typlen);
+
+	/* PASSEDBYVALUE */
+	if (typ->typbyval)
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, 0);
+		appendStringInfoString(buf, "PASSEDBYVALUE");
+	}
+
+	/* ALIGNMENT */
+	if (typ->typalign != TYPALIGN_INT)
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, 0);
+		switch (typ->typalign)
+		{
+			case TYPALIGN_CHAR:
+				appendStringInfoString(buf, "ALIGNMENT = char");
+				break;
+			case TYPALIGN_SHORT:
+				appendStringInfoString(buf, "ALIGNMENT = int2");
+				break;
+			case TYPALIGN_DOUBLE:
+				appendStringInfoString(buf, "ALIGNMENT = double");
+				break;
+		}
+	}
+
+	/* STORAGE */
+	if (typ->typstorage != TYPSTORAGE_PLAIN)
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, 0);
+		switch (typ->typstorage)
+		{
+			/* Output non-default storage types */
+			case TYPSTORAGE_EXTERNAL:
+				appendStringInfoString(buf, "STORAGE = external");
+				break;
+			case TYPSTORAGE_EXTENDED:
+				appendStringInfoString(buf, "STORAGE = extended");
+				break;
+			case TYPSTORAGE_MAIN:
+				appendStringInfoString(buf, "STORAGE = main");
+				break;
+		}
+	}
+
+	/* CATEGORY */
+	if (typ->typcategory != TYPCATEGORY_USER)
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, 0);
+		appendStringInfo(buf, "CATEGORY = '%c'", typ->typcategory);
+	}
+
+	/* PREFERRED */
+	if (typ->typispreferred)
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, 0);
+		appendStringInfoString(buf, "PREFERRED = true");
+	}
+
+	/* DEFAULT */
+	defaultDatum = SysCacheGetAttr(TYPEOID, typeTup,
+								   Anum_pg_type_typdefault, &isnull);
+	if (!isnull)
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, 0);
+		defaultValue = TextDatumGetCString(defaultDatum);
+		appendStringInfo(buf, "DEFAULT = %s",
+						quote_literal_cstr(defaultValue));
+	}
+
+	/* ELEMENT */
+	if (OidIsValid(typ->typelem))
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, 0);
+		appendStringInfo(buf, "ELEMENT = %s",
+						format_type_be(typ->typelem));
+	}
+
+	/* DELIMITER */
+	if (typ->typdelim != ',')
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, 0);
+		appendStringInfo(buf, "DELIMITER = '%c'", typ->typdelim);
+	}
+
+	/* COLLATABLE */
+	if (OidIsValid(typ->typcollation))
+	{
+		appendStringInfoString(buf, ", ");
+		appendContextKeyword(&context, "", 0, 0, 0);
+		appendStringInfoString(buf, "COLLATABLE = true");
+	}
+
+	appendContextKeyword(&context, "", -PRETTYINDENT_STD, 0, 0);
+	appendStringInfoChar(buf, ')');
 }
 
 
