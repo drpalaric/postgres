@@ -353,6 +353,7 @@ static char *deparse_expression_pretty(Node *expr, List *dpcontext,
 static char *pg_get_viewdef_worker(Oid viewoid,
 								   int prettyFlags, int wrapColumn);
 static char *pg_get_triggerdef_worker(Oid trigid, bool pretty);
+static char *pg_get_triggerdef_worker_formatted(Oid trigid);
 static int	decompile_column_index_array(Datum column_index_array, Oid relId,
 										 bool withPeriod, StringInfo buf);
 static char *pg_get_ruledef_worker(Oid ruleoid, int prettyFlags);
@@ -1161,6 +1162,298 @@ pg_get_triggerdef_worker(Oid trigid, bool pretty)
 
 	return buf.data;
 }
+
+Datum
+pg_get_triggerdef_formatted(PG_FUNCTION_ARGS)
+{
+	Oid			trigid = PG_GETARG_OID(0);
+	char	   	*res;
+
+	res = pg_get_triggerdef_worker_formatted(trigid);
+
+	if (res == NULL)
+		PG_RETURN_NULL();
+
+	PG_RETURN_TEXT_P(string_to_text(res));
+}
+
+static char *
+pg_get_triggerdef_worker_formatted(Oid trigid)
+{
+    HeapTuple   	ht_trig;
+    Form_pg_trigger trigrec;
+    StringInfoData 	buf;
+    deparse_context context;
+    Relation    	tgrel;
+    ScanKeyData 	skey[1];
+    SysScanDesc 	tgscan;
+	int				prettyFlags;
+    int         	findx = 0;
+    char       		*tgname;
+    char       		*tgoldtable;
+    char       		*tgnewtable;
+    Datum       	value;
+    bool        	isnull;
+
+	prettyFlags = GET_PRETTY_FLAGS(true);
+
+    /*
+     * Fetch the pg_trigger tuple by the Oid of the trigger
+     */
+    tgrel = table_open(TriggerRelationId, AccessShareLock);
+
+    ScanKeyInit(&skey[0],
+                Anum_pg_trigger_oid,
+                BTEqualStrategyNumber, F_OIDEQ,
+                ObjectIdGetDatum(trigid));
+
+    tgscan = systable_beginscan(tgrel, TriggerOidIndexId, true,
+                                NULL, 1, skey);
+
+    ht_trig = systable_getnext(tgscan);
+
+    if (!HeapTupleIsValid(ht_trig))
+    {
+        systable_endscan(tgscan);
+        table_close(tgrel, AccessShareLock);
+        return NULL;
+    }
+
+    trigrec = (Form_pg_trigger) GETSTRUCT(ht_trig);
+
+    /*
+     * Start the trigger definition. Note that the trigger's name should never
+     * be schema-qualified, but the trigger rel's name may be.
+     */
+    initStringInfo(&buf);
+
+    context.buf = &buf;
+	context.prettyFlags = prettyFlags;
+    context.wrapColumn = WRAP_COLUMN_DEFAULT;
+    context.indentLevel = 0;
+    context.colNamesVisible = true;
+
+    tgname = NameStr(trigrec->tgname);
+    appendStringInfo(&buf, "CREATE %sTRIGGER %s ",
+                     OidIsValid(trigrec->tgconstraint) ? "CONSTRAINT " : "",
+                     quote_identifier(tgname));
+
+    if (TRIGGER_FOR_BEFORE(trigrec->tgtype))
+        appendStringInfoString(&buf, "BEFORE");
+    else if (TRIGGER_FOR_AFTER(trigrec->tgtype))
+        appendStringInfoString(&buf, "AFTER");
+    else if (TRIGGER_FOR_INSTEAD(trigrec->tgtype))
+        appendStringInfoString(&buf, "INSTEAD OF");
+    else
+        elog(ERROR, "unexpected tgtype value: %d", trigrec->tgtype);
+
+    if (TRIGGER_FOR_INSERT(trigrec->tgtype))
+    {
+        appendStringInfoString(&buf, " INSERT");
+        findx++;
+    }
+    if (TRIGGER_FOR_DELETE(trigrec->tgtype))
+    {
+        if (findx > 0)
+            appendStringInfoString(&buf, " OR DELETE");
+        else
+            appendStringInfoString(&buf, " DELETE");
+        findx++;
+    }
+    if (TRIGGER_FOR_UPDATE(trigrec->tgtype))
+    {
+        if (findx > 0)
+            appendStringInfoString(&buf, " OR UPDATE");
+        else
+            appendStringInfoString(&buf, " UPDATE");
+        findx++;
+        /* tgattr is first var-width field, so OK to access directly */
+        if (trigrec->tgattr.dim1 > 0)
+        {
+            int         i;
+
+            appendStringInfoString(&buf, " OF ");
+            for (i = 0; i < trigrec->tgattr.dim1; i++)
+            {
+                char       *attname;
+
+                if (i > 0)
+                    appendStringInfoString(&buf, ", ");
+                attname = get_attname(trigrec->tgrelid,
+                                      trigrec->tgattr.values[i], false);
+                appendStringInfoString(&buf, quote_identifier(attname));
+            }
+        }
+    }
+    if (TRIGGER_FOR_TRUNCATE(trigrec->tgtype))
+    {
+        if (findx > 0)
+            appendStringInfoString(&buf, " OR TRUNCATE");
+        else
+            appendStringInfoString(&buf, " TRUNCATE");
+        findx++;
+    }
+
+    appendContextKeyword(&context, " ON ", 0, 0, PRETTYINDENT_VAR - 1);
+    appendStringInfo(&buf, "%s",
+                     generate_relation_name(trigrec->tgrelid, NIL));
+
+    if (OidIsValid(trigrec->tgconstraint))
+    {
+        if (OidIsValid(trigrec->tgconstrrelid))
+        {
+            appendContextKeyword(&context, " FROM ", 0, 0, PRETTYINDENT_VAR - 1);
+            appendStringInfoString(&buf, generate_relation_name(trigrec->tgconstrrelid, NIL));
+        }
+        if (!trigrec->tgdeferrable)
+            appendContextKeyword(&context, " NOT DEFERRABLE INITIALLY ", 0, 0, PRETTYINDENT_VAR - 1);
+        else
+            appendContextKeyword(&context, " DEFERRABLE INITIALLY ", 0, 0, PRETTYINDENT_VAR - 1);
+        if (trigrec->tginitdeferred)
+            appendStringInfoString(&buf, "DEFERRED");
+        else
+            appendStringInfoString(&buf, "IMMEDIATE");
+    }
+
+    value = fastgetattr(ht_trig, Anum_pg_trigger_tgoldtable,
+                        tgrel->rd_att, &isnull);
+    if (!isnull)
+        tgoldtable = NameStr(*DatumGetName(value));
+    else
+        tgoldtable = NULL;
+    value = fastgetattr(ht_trig, Anum_pg_trigger_tgnewtable,
+                        tgrel->rd_att, &isnull);
+    if (!isnull)
+        tgnewtable = NameStr(*DatumGetName(value));
+    else
+        tgnewtable = NULL;
+    if (tgoldtable != NULL || tgnewtable != NULL)
+    {
+        appendContextKeyword(&context, " REFERENCING", 0, 0, PRETTYINDENT_VAR - 1);
+        if (tgoldtable != NULL)
+            appendStringInfo(&buf, " OLD TABLE AS %s",
+                             quote_identifier(tgoldtable));
+        if (tgnewtable != NULL)
+            appendStringInfo(&buf, " NEW TABLE AS %s",
+                             quote_identifier(tgnewtable));
+    }
+
+    appendContextKeyword(&context, " FOR EACH ", 0, 0, PRETTYINDENT_VAR - 1);
+
+    if (TRIGGER_FOR_ROW(trigrec->tgtype))
+        appendStringInfoString(&buf, "ROW");
+    else
+        appendStringInfoString(&buf, "STATEMENT");
+
+    /* If the trigger has a WHEN qualification, add that */
+    value = fastgetattr(ht_trig, Anum_pg_trigger_tgqual,
+                        tgrel->rd_att, &isnull);
+    if (!isnull)
+    {
+        Node       *qual;
+        char        relkind;
+        deparse_context whenContext;
+        deparse_namespace dpns;
+        RangeTblEntry *oldrte;
+        RangeTblEntry *newrte;
+
+        appendContextKeyword(&context, " WHEN (", 0, 0, PRETTYINDENT_VAR - 1);
+
+        qual = stringToNode(TextDatumGetCString(value));
+
+        relkind = get_rel_relkind(trigrec->tgrelid);
+
+        /* Build minimal OLD and NEW RTEs for the rel */
+        oldrte = makeNode(RangeTblEntry);
+        oldrte->rtekind = RTE_RELATION;
+        oldrte->relid = trigrec->tgrelid;
+        oldrte->relkind = relkind;
+        oldrte->rellockmode = AccessShareLock;
+        oldrte->alias = makeAlias("old", NIL);
+        oldrte->eref = oldrte->alias;
+        oldrte->lateral = false;
+        oldrte->inh = false;
+        oldrte->inFromCl = true;
+
+        newrte = makeNode(RangeTblEntry);
+        newrte->rtekind = RTE_RELATION;
+        newrte->relid = trigrec->tgrelid;
+        newrte->relkind = relkind;
+        newrte->rellockmode = AccessShareLock;
+        newrte->alias = makeAlias("new", NIL);
+        newrte->eref = newrte->alias;
+        newrte->lateral = false;
+        newrte->inh = false;
+        newrte->inFromCl = true;
+
+        /* Build two-element rtable */
+        memset(&dpns, 0, sizeof(dpns));
+        dpns.rtable = list_make2(oldrte, newrte);
+        dpns.subplans = NIL;
+        dpns.ctes = NIL;
+        dpns.appendrels = NULL;
+        set_rtable_names(&dpns, NIL, NULL);
+        set_simple_column_names(&dpns);
+
+        /* Set up context with one-deep namespace stack */
+        whenContext.buf = &buf;
+        whenContext.namespaces = list_make1(&dpns);
+        whenContext.resultDesc = NULL;
+        whenContext.targetList = NIL;
+        whenContext.windowClause = NIL;
+        whenContext.varprefix = true;
+        whenContext.wrapColumn = WRAP_COLUMN_DEFAULT;
+        whenContext.indentLevel = PRETTYINDENT_STD;
+        whenContext.colNamesVisible = true;
+        whenContext.inGroupBy = false;
+        whenContext.varInOrderBy = false;
+        whenContext.appendparents = NULL;
+
+        get_rule_expr(qual, &whenContext, false);
+
+        appendStringInfoChar(&buf, ')');
+    }
+
+    appendContextKeyword(&context, " EXECUTE FUNCTION ", 0, 0, PRETTYINDENT_VAR - 1);
+    appendStringInfo(&buf, "%s(",
+                     generate_function_name(trigrec->tgfoid, 0,
+                                            NIL, NULL,
+                                            false, NULL, false));
+
+    if (trigrec->tgnargs > 0)
+    {
+        char       *p;
+        int         i;
+
+        value = fastgetattr(ht_trig, Anum_pg_trigger_tgargs,
+                            tgrel->rd_att, &isnull);
+        if (isnull)
+            elog(ERROR, "tgargs is null for trigger %u", trigid);
+        p = (char *) VARDATA_ANY(DatumGetByteaPP(value));
+        for (i = 0; i < trigrec->tgnargs; i++)
+        {
+            if (i > 0)
+                appendStringInfoString(&buf, ", ");
+            simple_quote_literal(&buf, p);
+            /* advance p to next string embedded in tgargs */
+            while (*p)
+                p++;
+            p++;
+        }
+    }
+
+    /* We deliberately do not put semi-colon at end */
+    appendStringInfoChar(&buf, ')');
+
+    /* Clean up */
+    systable_endscan(tgscan);
+
+    table_close(tgrel, AccessShareLock);
+
+    return buf.data;
+}
+
+
 
 /* ----------
  * pg_get_indexdef			- Get the definition of an index
