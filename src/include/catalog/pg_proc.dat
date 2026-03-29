@@ -4034,6 +4034,12 @@
   proname => 'pg_get_function_sqlbody', provolatile => 's',
   prorettype => 'text', proargtypes => 'oid',
   prosrc => 'pg_get_function_sqlbody' },
+{ oid => '8188', descr => 'get CREATE TYPE command for a type',
+  proname => 'pg_get_typedef', provolatile => 's', prorettype => 'text',
+  proargtypes => 'oid', prosrc => 'pg_get_typedef' },
+{ oid => '8286', descr => 'get CREATE TYPE command for a type with pretty formatting',
+  proname => 'pg_get_typedef', provolatile => 's', prorettype => 'text',
+  proargtypes => 'oid bool', prosrc => 'pg_get_typedef_ext' },
 
 { oid => '1686', descr => 'list of SQL keywords',
   proname => 'pg_get_keywords', procost => '10', prorows => '500',
