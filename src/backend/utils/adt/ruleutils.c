@@ -29,6 +29,7 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_depend.h"
+#include "catalog/pg_event_trigger.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
@@ -1172,6 +1173,124 @@ pg_get_triggerdef_worker(Oid trigid, bool pretty)
 
 	return buf.data;
 }
+
+/* ----------
+* pg_get_event_trigger_ddl - Get the DDL statement for an event trigger
+*  ----------
+*/
+Datum
+pg_get_event_trigger_ddl(PG_FUNCTION_ARGS)
+{
+	Name		evtName;
+	HeapTuple	evtTup;
+	HeapTuple	procTup;
+	Form_pg_event_trigger evtForm;
+	char		*evtevent;
+	Oid			evtfoid;
+	Datum		evttagsDatum;
+	bool		evttagsIsNull;
+	Form_pg_proc proc;
+	char		*proname;
+	char		prokind;
+	StringInfoData buf;
+
+	evtName = PG_GETARG_NAME(0);
+
+	/*
+	 * Check provided event trigger name exists
+	 */
+	evtTup = SearchSysCache1(EVENTTRIGGERNAME, NameGetDatum(evtName));
+
+	if (!HeapTupleIsValid(evtTup))
+		ereport(ERROR,
+			(errcode(ERRCODE_UNDEFINED_OBJECT),
+			 errmsg("event trigger \"%s\" does not exist", NameStr(*evtName))));
+
+	evtForm = (Form_pg_event_trigger) GETSTRUCT(evtTup);
+	evtevent = NameStr(evtForm->evtevent);
+	evtfoid = evtForm->evtfoid;
+
+	/*
+	 * Look up event trigger function.
+	 */
+	procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(evtfoid));
+
+	if (!HeapTupleIsValid(procTup))
+		elog(ERROR,
+			 "cache lookup failed for function %u", evtfoid);
+
+	proc = (Form_pg_proc) GETSTRUCT(procTup);
+	proname = NameStr(proc->proname);
+	prokind = proc->prokind;
+
+	Assert(prokind == PROKIND_FUNCTION || prokind == PROKIND_PROCEDURE);
+
+	/*
+	 * Assemble output.
+	 */
+	initStringInfo(&buf);
+
+	appendStringInfo(&buf, "CREATE EVENT TRIGGER %s ON %s",
+					quote_identifier(NameStr(*evtName)),
+					quote_identifier(evtevent));
+
+	/*
+	 * Generate WHEN clause, if any filter events were specified.
+	 *
+	 * Note that as of PostgreSQL 19, the only filter_variable supported
+	 * is "TAG", which is not stored in pg_event_trigger, so is hard-coded
+	 * in the generated output. This also means that by definition, the AND
+	 * clause supported by the CREATE EVENT TRIGGER grammar cannot be actually
+	 * be used in a valid statement, and thus will never be part of the
+	 * generated output.
+	 */
+	evttagsDatum = SysCacheGetAttr(EVENTTRIGGEROID, evtTup,
+							   Anum_pg_event_trigger_evttags,
+							   &evttagsIsNull);
+
+	if (!evttagsIsNull)
+	{
+		ArrayType  *arr = DatumGetArrayTypeP(evttagsDatum);
+		Datum	   *elems;
+		int			nelems;
+		int			i;
+
+		deconstruct_array_builtin(arr, TEXTOID, &elems, NULL, &nelems);
+
+		appendStringInfoString(&buf, " WHEN TAG IN (");
+
+		for (i = 0; i < nelems; ++i)
+		{
+			char	   *str = TextDatumGetCString(elems[i]);
+
+			if (i)
+				appendStringInfoChar(&buf, ',');
+
+			appendStringInfo(&buf, "'%s'", str);
+		}
+
+		appendStringInfoString(&buf, ")");
+	}
+
+	/*
+	 * Finally, add EXECUTE clause.
+	 */
+	appendStringInfo(&buf, " EXECUTE %s %s.%s()",
+					 prokind == PROKIND_FUNCTION ? "FUNCTION" : "PROCEDURE",
+					 quote_identifier(get_namespace_name(proc->pronamespace)),
+					 quote_identifier(proname));
+
+	/*
+	 * Terminate query
+	 */
+	appendStringInfoChar(&buf, ';');
+
+	/* Clean up */
+	ReleaseSysCache(evtTup);
+	ReleaseSysCache(procTup);
+	PG_RETURN_TEXT_P(string_to_text(buf.data));
+}
+
 
 /* ----------
  * pg_get_indexdef			- Get the definition of an index
