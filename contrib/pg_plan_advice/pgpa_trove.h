@@ -27,6 +27,7 @@ typedef struct pgpa_trove_entry
 {
 	pgpa_advice_tag_type tag;
 	pgpa_advice_target *target;
+	pgpa_advice_item *card_item;
 	int			flags;
 } pgpa_trove_entry;
 
@@ -47,12 +48,15 @@ typedef struct pgpa_trove_entry
  * level and (2) other types of join advice affect only what to do from
  * join_path_setup_hook, but partitionwise advice affects what to do in
  * joinrel_setup_hook.
+ *
+ * PGPA_TROVE_LOOKUP_CARDINALITY means we're looking for cardinality advice.
  */
 typedef enum pgpa_trove_lookup_type
 {
 	PGPA_TROVE_LOOKUP_JOIN,
 	PGPA_TROVE_LOOKUP_REL,
-	PGPA_TROVE_LOOKUP_SCAN
+	PGPA_TROVE_LOOKUP_SCAN,
+	PGPA_TROVE_LOOKUP_CARDINALITY
 } pgpa_trove_lookup_type;
 
 /*

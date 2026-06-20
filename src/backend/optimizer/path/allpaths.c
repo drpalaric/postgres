@@ -988,6 +988,9 @@ set_foreign_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	/* ... but do not let it set the rows estimate to zero */
 	rel->rows = clamp_row_est(rel->rows);
 
+	adjust_rel_rows_estimate(root, rel, NULL, NULL,
+							 RELROWS_EST_BASE, &rel->rows);
+
 	/*
 	 * Also, make sure rel->tuples is not insane relative to rel->rows.
 	 * Notably, this ensures sanity if pg_class.reltuples contains -1 and the

@@ -8,6 +8,9 @@
  */
 #include "postgres.h"
 
+#include <errno.h>
+#include <stdlib.h>
+
 #include "common/string.h"
 #include "nodes/miscnodes.h"
 #include "parser/scansup.h"
@@ -82,6 +85,8 @@ identifier		{ident_start}{ident_cont}*
 
 decdigit		[0-9]
 decinteger		{decdigit}(_?{decdigit})*
+decdot		\.{decdigit}(_?{decdigit})*
+decfloat		{decinteger}{decdot}({decdigit}(_?{decdigit})*)?
 
 space			[ \t\n\r\f\v]
 whitespace		{space}+
@@ -131,8 +136,21 @@ xcinside		[^*/]+
 							 tag == PGPA_TAG_NO_GATHER ||
 							 tag == PGPA_TAG_DO_NOT_SCAN)
 						return TOK_TAG_SIMPLE;
+					else if (tag == PGPA_TAG_CARDINALITY)
+						return TOK_TAG_CARDINALITY;
 					else
 						return TOK_TAG_GENERIC;
+				}
+
+{decfloat}		{
+					char	   *endptr;
+
+					errno = 0;
+					yylval->real = strtod(yytext, &endptr);
+					if (*endptr != '\0' || errno == ERANGE)
+						pgpa_yyerror(result, parse_error_msg_p, yyscanner,
+									 "floating-point literal out of range");
+					return TOK_FLOAT;
 				}
 
 {decinteger}	{

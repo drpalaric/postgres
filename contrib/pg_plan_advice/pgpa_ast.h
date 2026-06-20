@@ -80,6 +80,7 @@ typedef struct pgpa_advice_target
 typedef enum pgpa_advice_tag_type
 {
 	PGPA_TAG_BITMAP_HEAP_SCAN,
+	PGPA_TAG_CARDINALITY,
 	PGPA_TAG_DO_NOT_SCAN,
 	PGPA_TAG_FOREIGN_JOIN,
 	PGPA_TAG_GATHER,
@@ -101,11 +102,22 @@ typedef enum pgpa_advice_tag_type
 	PGPA_TAG_TID_SCAN
 } pgpa_advice_tag_type;
 
+typedef enum pgpa_cardinality_op
+{
+	PGPA_CARD_ADD,
+	PGPA_CARD_SUB,
+	PGPA_CARD_MUL,
+	PGPA_CARD_DIV,
+	PGPA_CARD_SET
+} pgpa_cardinality_op;
+
 /*
  * An item of advice, meaning a tag and the list of all targets to which
  * it is being applied.
  *
  * "targets" is a list of pgpa_advice_target objects.
+ *
+ * card_op and card_value are used only when tag is PGPA_TAG_CARDINALITY.
  *
  * The List returned from pgpa_yyparse is list of pgpa_advice_item objects.
  */
@@ -113,6 +125,8 @@ typedef struct pgpa_advice_item
 {
 	pgpa_advice_tag_type tag;
 	List	   *targets;
+	pgpa_cardinality_op card_op;
+	double		card_value;
 } pgpa_advice_item;
 
 /*
@@ -178,6 +192,9 @@ extern pgpa_itm_type pgpa_identifiers_match_target(int nrids,
 extern bool pgpa_index_targets_equal(pgpa_index_target *i1,
 									 pgpa_index_target *i2);
 extern pgpa_advice_tag_type pgpa_parse_advice_tag(const char *tag, bool *fail);
+extern bool pgpa_cardinality_item_is_join(pgpa_advice_item *item);
+extern void pgpa_apply_cardinality_op(pgpa_cardinality_op op, double value,
+									  double *rows);
 extern void pgpa_format_advice_target(StringInfo str,
 									  pgpa_advice_target *target);
 extern void pgpa_format_index_target(StringInfo str,

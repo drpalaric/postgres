@@ -53,6 +53,7 @@ struct pgpa_trove
 	pgpa_trove_slice join;
 	pgpa_trove_slice rel;
 	pgpa_trove_slice scan;
+	pgpa_trove_slice cardinality;
 };
 
 /*
@@ -137,6 +138,7 @@ pgpa_build_trove(List *advice_items)
 	pgpa_init_trove_slice(&trove->join);
 	pgpa_init_trove_slice(&trove->rel);
 	pgpa_init_trove_slice(&trove->scan);
+	pgpa_init_trove_slice(&trove->cardinality);
 
 	foreach_ptr(pgpa_advice_item, item, advice_items)
 	{
@@ -219,6 +221,37 @@ pgpa_build_trove(List *advice_items)
 											item->tag, target);
 				}
 				break;
+
+			case PGPA_TAG_CARDINALITY:
+				{
+					pgpa_trove_entry *entry;
+
+					if (trove->cardinality.nused >= trove->cardinality.nallocated)
+					{
+						int			new_allocated;
+
+						new_allocated = trove->cardinality.nallocated * 2;
+						trove->cardinality.entries =
+							repalloc_array(trove->cardinality.entries,
+										   pgpa_trove_entry,
+										   new_allocated);
+						trove->cardinality.nallocated = new_allocated;
+					}
+
+					entry = &trove->cardinality.entries[trove->cardinality.nused];
+					entry->tag = item->tag;
+					entry->target = NULL;
+					entry->card_item = item;
+					entry->flags = 0;
+
+					foreach_ptr(pgpa_advice_target, target, item->targets)
+						pgpa_trove_add_to_hash(trove->cardinality.hash,
+											   target,
+											   trove->cardinality.nused);
+
+					trove->cardinality.nused++;
+				}
+				break;
 		}
 	}
 
@@ -244,6 +277,8 @@ pgpa_trove_lookup(pgpa_trove *trove, pgpa_trove_lookup_type type,
 		tslice = &trove->scan;
 	else if (type == PGPA_TROVE_LOOKUP_JOIN)
 		tslice = &trove->join;
+	else if (type == PGPA_TROVE_LOOKUP_CARDINALITY)
+		tslice = &trove->cardinality;
 	else
 		tslice = &trove->rel;
 
@@ -283,6 +318,8 @@ pgpa_trove_lookup_all(pgpa_trove *trove, pgpa_trove_lookup_type type,
 		tslice = &trove->scan;
 	else if (type == PGPA_TROVE_LOOKUP_JOIN)
 		tslice = &trove->join;
+	else if (type == PGPA_TROVE_LOOKUP_CARDINALITY)
+		tslice = &trove->cardinality;
 	else
 		tslice = &trove->rel;
 
@@ -297,9 +334,58 @@ char *
 pgpa_cstring_trove_entry(pgpa_trove_entry *entry)
 {
 	StringInfoData buf;
+	pgpa_advice_item *item;
+	const char	   *opstr;
 
 	initStringInfo(&buf);
 	appendStringInfoString(&buf, pgpa_cstring_advice_tag(entry->tag));
+
+	if (entry->tag == PGPA_TAG_CARDINALITY)
+	{
+		Assert(entry->card_item != NULL);
+		item = entry->card_item;
+
+		appendStringInfoChar(&buf, '(');
+		if (pgpa_cardinality_item_is_join(item))
+			pgpa_format_advice_target(&buf, linitial(item->targets));
+		else
+		{
+			bool		first = true;
+
+			foreach_ptr(pgpa_advice_target, target, item->targets)
+			{
+				if (!first)
+					appendStringInfoChar(&buf, ' ');
+				first = false;
+				pgpa_format_advice_target(&buf, target);
+			}
+		}
+
+		switch (item->card_op)
+		{
+			case PGPA_CARD_ADD:
+				opstr = "+";
+				break;
+			case PGPA_CARD_SUB:
+				opstr = "-";
+				break;
+			case PGPA_CARD_MUL:
+				opstr = "*";
+				break;
+			case PGPA_CARD_DIV:
+				opstr = "/";
+				break;
+			case PGPA_CARD_SET:
+				opstr = "=";
+				break;
+			default:
+				opstr = "?";
+				break;
+		}
+
+		appendStringInfo(&buf, " %s %g)", opstr, item->card_value);
+		return buf.data;
+	}
 
 	/* JOIN_ORDER tags are transformed by pgpa_build_trove; undo that here */
 	if (entry->tag != PGPA_TAG_JOIN_ORDER)
@@ -384,6 +470,7 @@ pgpa_trove_add_to_slice(pgpa_trove_slice *tslice,
 	entry = &tslice->entries[tslice->nused];
 	entry->tag = tag;
 	entry->target = target;
+	entry->card_item = NULL;
 	entry->flags = 0;
 
 	pgpa_trove_add_to_hash(tslice->hash, target, tslice->nused);
@@ -502,14 +589,27 @@ pgpa_trove_slice_lookup(pgpa_trove_slice *tslice, pgpa_identifier *rid)
 		while ((i = bms_next_member(element->indexes, i)) >= 0)
 		{
 			pgpa_trove_entry *entry = &tslice->entries[i];
+			bool		matched = false;
 
 			/*
-			 * We know that this target or one of its descendants matches the
-			 * identifier on the three key fields above, but we don't know
-			 * which descendant or whether the occurrence and schema also
-			 * match.
+			 * CARDINALITY entries store their targets on card_item rather
+			 * than entry->target.
 			 */
-			if (pgpa_identifier_matches_target(rid, entry->target))
+			if (entry->target != NULL)
+				matched = pgpa_identifier_matches_target(rid, entry->target);
+			else if (entry->card_item != NULL)
+			{
+				foreach_ptr(pgpa_advice_target, target, entry->card_item->targets)
+				{
+					if (pgpa_identifier_matches_target(rid, target))
+					{
+						matched = true;
+						break;
+					}
+				}
+			}
+
+			if (matched)
 				result = bms_add_member(result, i);
 		}
 	}

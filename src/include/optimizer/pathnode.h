@@ -48,6 +48,40 @@ typedef void (*joinrel_setup_hook_type) (PlannerInfo *root,
 extern PGDLLIMPORT joinrel_setup_hook_type joinrel_setup_hook;
 
 /*
+ * Hook for plugins to adjust row count estimates after the core planner
+ * has computed them.
+ *
+ * The hook is invoked from adjust_rel_rows_estimate(), which is called
+ * after set_baserel_size_estimates(), set_joinrel_size_estimates(), and
+ * when creating new ParamPathInfo entries for parameterized paths.
+ *
+ * RELROWS_EST_BASE and RELROWS_EST_JOIN adjust rel->rows.
+ * RELROWS_EST_PARAM_BASE and RELROWS_EST_PARAM_JOIN adjust ppi_rows for
+ * a newly-created ParamPathInfo.
+ *
+ * For join kinds, outer_rel and inner_rel identify the pair of input rels
+ * that prompted creation of the joinrel or parameterized join path.
+ *
+ * adjust_rel_rows_estimate() re-applies clamp_row_est() after the hook,
+ * and for parameterized kinds ensures the result does not exceed rel->rows.
+ */
+typedef enum RelRowsEstimateKind
+{
+	RELROWS_EST_BASE,			/* baserel->rows */
+	RELROWS_EST_JOIN,			/* joinrel->rows */
+	RELROWS_EST_PARAM_BASE,		/* ParamPathInfo.ppi_rows for a baserel */
+	RELROWS_EST_PARAM_JOIN		/* ParamPathInfo.ppi_rows for a joinrel */
+} RelRowsEstimateKind;
+
+typedef void (*rel_rows_estimate_hook_type) (PlannerInfo *root,
+											 RelOptInfo *rel,
+											 RelOptInfo *outer_rel,
+											 RelOptInfo *inner_rel,
+											 RelRowsEstimateKind kind,
+											 double *rows);
+extern PGDLLIMPORT rel_rows_estimate_hook_type rel_rows_estimate_hook;
+
+/*
  * prototypes for pathnode.c
  */
 extern int	compare_path_costs(Path *path1, Path *path2,

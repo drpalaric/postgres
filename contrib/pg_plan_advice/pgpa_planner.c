@@ -90,6 +90,7 @@ typedef struct pgpa_join_state
 static build_simple_rel_hook_type prev_build_simple_rel = NULL;
 static join_path_setup_hook_type prev_join_path_setup = NULL;
 static joinrel_setup_hook_type prev_joinrel_setup = NULL;
+static rel_rows_estimate_hook_type prev_rel_rows_estimate = NULL;
 static planner_setup_hook_type prev_planner_setup = NULL;
 static planner_shutdown_hook_type prev_planner_shutdown = NULL;
 
@@ -120,6 +121,9 @@ static void pgpa_join_path_setup(PlannerInfo *root,
 								 RelOptInfo *innerrel,
 								 JoinType jointype,
 								 JoinPathExtraData *extra);
+static void pgpa_rel_rows_estimate(PlannerInfo *root, RelOptInfo *rel,
+								   RelOptInfo *outer_rel, RelOptInfo *inner_rel,
+								   RelRowsEstimateKind kind, double *rows);
 static pgpa_join_state *pgpa_get_join_state(PlannerInfo *root,
 											RelOptInfo *joinrel,
 											RelOptInfo *outerrel,
@@ -191,6 +195,8 @@ pgpa_planner_install_hooks(void)
 	joinrel_setup_hook = pgpa_joinrel_setup;
 	prev_join_path_setup = join_path_setup_hook;
 	join_path_setup_hook = pgpa_join_path_setup;
+	prev_rel_rows_estimate = rel_rows_estimate_hook;
+	rel_rows_estimate_hook = pgpa_rel_rows_estimate;
 }
 
 /*
@@ -377,6 +383,10 @@ pgpa_planner_shutdown(PlannerGlobal *glob, Query *parse,
 												trove,
 												PGPA_TROVE_LOOKUP_REL,
 												rt_identifiers, &walker);
+		feedback = pgpa_planner_append_feedback(feedback,
+												trove,
+												PGPA_TROVE_LOOKUP_CARDINALITY,
+												rt_identifiers, &walker);
 
 		pgpa_items = lappend(pgpa_items, makeDefElem("feedback",
 													 (Node *) feedback, -1));
@@ -464,6 +474,209 @@ pgpa_build_simple_rel(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	/* Pass call to previous hook. */
 	if (prev_build_simple_rel)
 		(*prev_build_simple_rel) (root, rel, rte);
+}
+
+/*
+ * Apply CARDINALITY advice relevant to a baserel row estimate.
+ */
+static void
+pgpa_apply_baserel_cardinality(PlannerInfo *root, pgpa_planner_state *pps,
+							   pgpa_identifier *rid, double *rows)
+{
+	pgpa_trove_result tresult;
+	int			i = -1;
+	int			match_count = 0;
+
+	pgpa_trove_lookup(pps->trove, PGPA_TROVE_LOOKUP_CARDINALITY, 1, rid,
+					  &tresult);
+	if (tresult.indexes == NULL)
+		return;
+
+	while ((i = bms_next_member(tresult.indexes, i)) >= 0)
+	{
+		pgpa_trove_entry *entry = &tresult.entries[i];
+		pgpa_advice_item *item = entry->card_item;
+		bool		matched = false;
+
+		Assert(item != NULL && item->tag == PGPA_TAG_CARDINALITY);
+
+		if (pgpa_cardinality_item_is_join(item))
+			continue;
+
+		foreach_ptr(pgpa_advice_target, target, item->targets)
+		{
+			if (pgpa_identifier_matches_target(rid, target))
+			{
+				matched = true;
+				break;
+			}
+		}
+
+		if (!matched)
+			continue;
+
+		entry->flags |= PGPA_FB_MATCH_PARTIAL;
+		match_count++;
+		pgpa_apply_cardinality_op(item->card_op, item->card_value, rows);
+	}
+
+	if (match_count > 1)
+	{
+		i = -1;
+		while ((i = bms_next_member(tresult.indexes, i)) >= 0)
+		{
+			pgpa_trove_entry *entry = &tresult.entries[i];
+
+			if ((entry->flags & PGPA_FB_MATCH_PARTIAL) != 0)
+				entry->flags |= PGPA_FB_CONFLICTING;
+		}
+	}
+	else if (match_count == 1)
+	{
+		i = -1;
+		while ((i = bms_next_member(tresult.indexes, i)) >= 0)
+		{
+			pgpa_trove_entry *entry = &tresult.entries[i];
+
+			if ((entry->flags & PGPA_FB_MATCH_PARTIAL) != 0)
+				entry->flags |= PGPA_FB_MATCH_FULL;
+		}
+	}
+}
+
+/*
+ * Apply CARDINALITY advice relevant to a joinrel row estimate.
+ */
+static void
+pgpa_apply_joinrel_cardinality(PlannerInfo *root, pgpa_planner_state *pps,
+							   RelOptInfo *joinrel,
+							   RelOptInfo *outerrel, RelOptInfo *innerrel,
+							   double *rows)
+{
+	pgpa_identifier *rids;
+	int			nrids;
+	int			outer_count;
+	int			inner_count;
+	pgpa_trove_result tresult;
+	int			i = -1;
+	int			match_count = 0;
+
+	nrids = bms_num_members(joinrel->relids);
+	if (nrids <= 0)
+		return;
+
+	rids = palloc_array(pgpa_identifier, nrids);
+	outer_count = pgpa_compute_identifiers_by_relids(root, outerrel->relids, rids);
+	inner_count = pgpa_compute_identifiers_by_relids(root, innerrel->relids,
+													 rids + outer_count);
+	nrids = outer_count + inner_count;
+
+	pgpa_trove_lookup(pps->trove, PGPA_TROVE_LOOKUP_CARDINALITY, nrids, rids,
+					  &tresult);
+	if (tresult.indexes == NULL)
+		return;
+
+	while ((i = bms_next_member(tresult.indexes, i)) >= 0)
+	{
+		pgpa_trove_entry *entry = &tresult.entries[i];
+		pgpa_advice_item *item = entry->card_item;
+		pgpa_advice_target *target;
+		pgpa_itm_type join_itm;
+		pgpa_itm_type outer_itm;
+		pgpa_itm_type inner_itm;
+
+		Assert(item != NULL && item->tag == PGPA_TAG_CARDINALITY);
+
+		if (!pgpa_cardinality_item_is_join(item))
+			continue;
+
+		target = linitial(item->targets);
+		join_itm = pgpa_identifiers_match_target(nrids, rids, target);
+		if (join_itm != PGPA_ITM_EQUAL)
+			continue;
+
+		outer_itm = pgpa_identifiers_match_target(outer_count, rids, target);
+		if (outer_itm == PGPA_ITM_EQUAL ||
+			outer_itm == PGPA_ITM_TARGETS_ARE_SUBSET)
+			continue;
+
+		inner_itm = pgpa_identifiers_match_target(inner_count,
+												  rids + outer_count,
+												  target);
+		if (inner_itm == PGPA_ITM_EQUAL ||
+			inner_itm == PGPA_ITM_TARGETS_ARE_SUBSET)
+			continue;
+
+		entry->flags |= PGPA_FB_MATCH_PARTIAL;
+		match_count++;
+		pgpa_apply_cardinality_op(item->card_op, item->card_value, rows);
+	}
+
+	if (match_count > 1)
+	{
+		i = -1;
+		while ((i = bms_next_member(tresult.indexes, i)) >= 0)
+		{
+			pgpa_trove_entry *entry = &tresult.entries[i];
+
+			if ((entry->flags & PGPA_FB_MATCH_PARTIAL) != 0)
+				entry->flags |= PGPA_FB_CONFLICTING;
+		}
+	}
+	else if (match_count == 1)
+	{
+		i = -1;
+		while ((i = bms_next_member(tresult.indexes, i)) >= 0)
+		{
+			pgpa_trove_entry *entry = &tresult.entries[i];
+
+			if ((entry->flags & PGPA_FB_MATCH_PARTIAL) != 0)
+				entry->flags |= PGPA_FB_MATCH_FULL;
+		}
+	}
+}
+
+/*
+ * Hook function for rel_rows_estimate_hook.
+ */
+static void
+pgpa_rel_rows_estimate(PlannerInfo *root, RelOptInfo *rel,
+					   RelOptInfo *outer_rel, RelOptInfo *inner_rel,
+					   RelRowsEstimateKind kind, double *rows)
+{
+	pgpa_planner_state *pps;
+	pgpa_planner_info *proot;
+
+	pps = GetPlannerGlobalExtensionState(root->glob, planner_extension_id);
+	if (pps == NULL || pps->trove == NULL)
+		goto chain;
+
+	switch (kind)
+	{
+		case RELROWS_EST_BASE:
+		case RELROWS_EST_PARAM_BASE:
+			if (rel->relid > 0)
+			{
+				proot = pgpa_planner_get_proot(pps, root);
+				pgpa_compute_rt_identifier(proot, root, rel);
+				pgpa_apply_baserel_cardinality(root, pps,
+											   &proot->rid_array[rel->relid - 1],
+											   rows);
+			}
+			break;
+
+		case RELROWS_EST_JOIN:
+		case RELROWS_EST_PARAM_JOIN:
+			if (outer_rel != NULL && inner_rel != NULL &&
+				bms_num_members(rel->relids) > 1)
+				pgpa_apply_joinrel_cardinality(root, pps, rel,
+											   outer_rel, inner_rel, rows);
+			break;
+	}
+
+chain:
+	if (prev_rel_rows_estimate)
+		(*prev_rel_rows_estimate) (root, rel, outer_rel, inner_rel, kind, rows);
 }
 
 /*
@@ -1885,9 +2098,10 @@ pgpa_planner_append_feedback(List *list, pgpa_trove *trove,
 		/*
 		 * If this entry was fully matched, check whether generating advice
 		 * from this plan would produce such an entry. If not, label the entry
-		 * as failed.
+		 * as failed. CARDINALITY advice is apply-only, so skip this check.
 		 */
-		if ((entry->flags & PGPA_FB_MATCH_FULL) != 0 &&
+		if (entry->tag != PGPA_TAG_CARDINALITY &&
+			(entry->flags & PGPA_FB_MATCH_FULL) != 0 &&
 			!pgpa_walker_would_advise(walker, rt_identifiers,
 									  entry->tag, entry->target))
 			entry->flags |= PGPA_FB_FAILED;

@@ -32,6 +32,8 @@ pgpa_cstring_advice_tag(pgpa_advice_tag_type advice_tag)
 	{
 		case PGPA_TAG_BITMAP_HEAP_SCAN:
 			return "BITMAP_HEAP_SCAN";
+		case PGPA_TAG_CARDINALITY:
+			return "CARDINALITY";
 		case PGPA_TAG_DO_NOT_SCAN:
 			return "DO_NOT_SCAN";
 		case PGPA_TAG_FOREIGN_JOIN:
@@ -93,6 +95,10 @@ pgpa_parse_advice_tag(const char *tag, bool *fail)
 		case 'b':
 			if (strcmp(tag, "bitmap_heap_scan") == 0)
 				return PGPA_TAG_BITMAP_HEAP_SCAN;
+			break;
+		case 'c':
+			if (strcmp(tag, "cardinality") == 0)
+				return PGPA_TAG_CARDINALITY;
 			break;
 		case 'd':
 			if (strcmp(tag, "do_not_scan") == 0)
@@ -354,4 +360,47 @@ pgpa_identifiers_cover_target(int nrids, pgpa_identifier *rids,
 	}
 
 	return result;
+}
+
+/*
+ * Returns true if a CARDINALITY advice item uses parenthesized join syntax.
+ */
+bool
+pgpa_cardinality_item_is_join(pgpa_advice_item *item)
+{
+	pgpa_advice_target *target;
+
+	Assert(item->tag == PGPA_TAG_CARDINALITY);
+
+	if (list_length(item->targets) != 1)
+		return false;
+
+	target = linitial(item->targets);
+	return target->ttype == PGPA_TARGET_ORDERED_LIST;
+}
+
+/*
+ * Apply a cardinality adjustment operator to a row estimate.
+ */
+void
+pgpa_apply_cardinality_op(pgpa_cardinality_op op, double value, double *rows)
+{
+	switch (op)
+	{
+		case PGPA_CARD_ADD:
+			*rows += value;
+			break;
+		case PGPA_CARD_SUB:
+			*rows -= value;
+			break;
+		case PGPA_CARD_MUL:
+			*rows *= value;
+			break;
+		case PGPA_CARD_DIV:
+			*rows /= value;
+			break;
+		case PGPA_CARD_SET:
+			*rows = value;
+			break;
+	}
 }

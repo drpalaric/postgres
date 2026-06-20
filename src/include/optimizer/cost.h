@@ -16,6 +16,7 @@
 
 #include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
+#include "optimizer/pathnode.h"
 
 
 /* defaults for costsize.c's Cost parameters */
@@ -208,6 +209,11 @@ extern void set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 									   RelOptInfo *inner_rel,
 									   SpecialJoinInfo *sjinfo,
 									   List *restrictlist);
+extern void adjust_rel_rows_estimate(PlannerInfo *root, RelOptInfo *rel,
+									 RelOptInfo *outer_rel,
+									 RelOptInfo *inner_rel,
+									 RelRowsEstimateKind kind,
+									 double *rows);
 extern void set_subquery_size_estimates(PlannerInfo *root, RelOptInfo *rel);
 extern void set_function_size_estimates(PlannerInfo *root, RelOptInfo *rel);
 extern void set_values_size_estimates(PlannerInfo *root, RelOptInfo *rel);

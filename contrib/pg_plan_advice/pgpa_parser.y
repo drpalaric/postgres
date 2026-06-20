@@ -37,29 +37,35 @@
 %lex-param {char **parse_error_msg_p}
 %lex-param {yyscan_t yyscanner}
 %pure-parser
-%expect 0
+%expect 1
 %name-prefix="pgpa_yy"
 
 %union
 {
 	char	   *str;
 	int			integer;
+	double		real;
 	List	   *list;
 	pgpa_advice_item *item;
 	pgpa_advice_target *target;
 	pgpa_index_target *itarget;
+	pgpa_cardinality_op card_op;
 }
 %token <str> TOK_IDENT TOK_TAG_JOIN_ORDER TOK_TAG_INDEX
 %token <str> TOK_TAG_SIMPLE TOK_TAG_GENERIC
+%token <str> TOK_TAG_CARDINALITY
 %token <integer> TOK_INTEGER
+%token <real> TOK_FLOAT
 
 %type <integer> opt_ri_occurrence
+%type <real> cardinality_number
+%type <card_op> cardinality_op
 %type <item> advice_item
 %type <list> advice_item_list generic_target_list
-%type <list> index_target_list join_order_target_list
+%type <list> cardinality_target_list cardinality_baserel_list index_target_list join_order_target_list
 %type <list> opt_partition simple_target_list
 %type <str> identifier opt_plan_name
-%type <target> generic_sublist join_order_sublist
+%type <target> cardinality_join_target generic_sublist join_order_sublist
 %type <target> relation_identifier
 %type <itarget> index_name
 
@@ -143,6 +149,32 @@ advice_item: TOK_TAG_JOIN_ORDER '(' join_order_target_list ')'
 
 			$$->targets = $3;
 		}
+	| TOK_TAG_CARDINALITY '(' cardinality_target_list cardinality_op cardinality_number ')'
+		{
+			$$ = palloc0_object(pgpa_advice_item);
+			$$->tag = PGPA_TAG_CARDINALITY;
+			$$->targets = $3;
+			$$->card_op = $4;
+			$$->card_value = $5;
+
+			if ($3 == NIL)
+				pgpa_yyerror(result, parse_error_msg_p, yyscanner,
+							 "CARDINALITY must have at least one target");
+
+			if ($$->card_op == PGPA_CARD_DIV && $5 == 0.0)
+				pgpa_yyerror(result, parse_error_msg_p, yyscanner,
+							 "CARDINALITY division by zero is not permitted");
+
+			if (list_length($3) == 1)
+			{
+				pgpa_advice_target *target = linitial($3);
+
+				if (target->ttype == PGPA_TARGET_ORDERED_LIST &&
+					list_length(target->children) < 2)
+					pgpa_yyerror(result, parse_error_msg_p, yyscanner,
+								 "CARDINALITY join target must contain at least two relation identifiers");
+			}
+		}
 	;
 
 relation_identifier: identifier opt_ri_occurrence opt_partition opt_plan_name
@@ -195,6 +227,7 @@ identifier: TOK_IDENT
 	| TOK_TAG_INDEX
 	| TOK_TAG_SIMPLE
 	| TOK_TAG_GENERIC
+	| TOK_TAG_CARDINALITY
 	;
 
 /*
@@ -270,6 +303,44 @@ simple_target_list: simple_target_list relation_identifier
 		{ $$ = lappend($1, $2); }
 	|
 		{ $$ = NIL; }
+	;
+
+cardinality_target_list: cardinality_join_target
+		{ $$ = list_make1($1); }
+	| cardinality_baserel_list
+		{ $$ = $1; }
+	;
+
+cardinality_baserel_list: relation_identifier
+		{ $$ = list_make1($1); }
+	| cardinality_baserel_list relation_identifier
+		{ $$ = lappend($1, $2); }
+	;
+
+cardinality_join_target: '(' simple_target_list ')'
+		{
+			$$ = palloc0_object(pgpa_advice_target);
+			$$->ttype = PGPA_TARGET_ORDERED_LIST;
+			$$->children = $2;
+		}
+	;
+
+cardinality_op: '+'
+		{ $$ = PGPA_CARD_ADD; }
+	| '-'
+		{ $$ = PGPA_CARD_SUB; }
+	| '*'
+		{ $$ = PGPA_CARD_MUL; }
+	| '/'
+		{ $$ = PGPA_CARD_DIV; }
+	| '='
+		{ $$ = PGPA_CARD_SET; }
+	;
+
+cardinality_number: TOK_INTEGER
+		{ $$ = (double) $1; }
+	| TOK_FLOAT
+		{ $$ = $1; }
 	;
 
 %%

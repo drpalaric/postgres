@@ -53,6 +53,9 @@ build_simple_rel_hook_type build_simple_rel_hook = NULL;
 /* Hook for plugins to get control during joinrel setup */
 joinrel_setup_hook_type joinrel_setup_hook = NULL;
 
+/* Hook for plugins to adjust row count estimates */
+rel_rows_estimate_hook_type rel_rows_estimate_hook = NULL;
+
 static void build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
 								RelOptInfo *input_rel,
 								SpecialJoinInfo *sjinfo,
@@ -1775,6 +1778,9 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 	/* Estimate the number of rows returned by the parameterized scan */
 	rows = get_parameterized_baserel_size(root, baserel, pclauses);
 
+	adjust_rel_rows_estimate(root, baserel, NULL, NULL,
+							 RELROWS_EST_PARAM_BASE, &rows);
+
 	/* And now we can build the ParamPathInfo */
 	ppi = makeNode(ParamPathInfo);
 	ppi->ppi_req_outer = required_outer;
@@ -1983,6 +1989,11 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 										  inner_path,
 										  sjinfo,
 										  *restrict_clauses);
+
+	adjust_rel_rows_estimate(root, joinrel,
+							 outer_path->parent,
+							 inner_path->parent,
+							 RELROWS_EST_PARAM_JOIN, &rows);
 
 	/*
 	 * And now we can build the ParamPathInfo.  No point in saving the

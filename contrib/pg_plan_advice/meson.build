@@ -54,6 +54,7 @@ tests += {
   'regress': {
     'sql': [
       'alternatives',
+      'cardinality',
       'gather',
       'join_order',
       'join_strategy',

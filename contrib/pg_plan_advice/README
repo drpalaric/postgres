@@ -234,6 +234,34 @@ respectively, should be placed. Each argument to NO_GATHER() is a single
 relation that should not appear beneath any Gather or Gather Merge node;
 that is, parallelism should not be used.
 
+Cardinality Advice
+==================
+
+CARDINALITY() advice adjusts the planner's row count estimates for base
+relations or joins. Unlike most other advice tags, CARDINALITY advice is
+apply-only: the module does not generate CARDINALITY advice from existing
+plans, and it cannot be round-tripped.
+
+The syntax is:
+
+  CARDINALITY(<target> <op> <number>)
+
+where <op> is one of +, -, *, /, or =, and <number> is a floating-point
+literal. Parentheses distinguish join targets from lists of base relations:
+
+  CARDINALITY(a + 2)         -- add 2 to the scan estimate for a
+  CARDINALITY(a b + 2)       -- add 2 to the scan estimate for a and for b
+  CARDINALITY((a b) * 2)     -- multiply the row estimate of the lowest
+                               join that contains exactly a and b (and no
+                               larger join rel that already contains both)
+
+For a parenthesized join target with more than two relations, the adjustment
+applies at the lowest join where neither input already contains the full
+target set. Row estimates are clamped to sane values after the adjustment.
+
+CARDINALITY advice does not currently apply to inherited or append parents,
+some grouped-aggregation join rels, or UNION/setop rels.
+
 Implicit Join Order Constraints
 ===============================
 
@@ -257,11 +285,5 @@ More seriously, we don't know anything about eager aggregation, which could
 have a large impact on the shape of the plan tree. XXX: This needs some study
 to determine how large a problem it is, and might need to be fixed sooner
 rather than later.
-
-We don't offer any control over estimates, only outcomes. It seems like a
-good idea to incorporate that ability at some future point, as pg_hint_plan
-does. However, since the primary goal of the initial development work is to be
-able to induce the planner to recreate a desired plan that worked well in
-the past, this has not been included in the initial development effort.
 
 XXX Need to investigate whether and how well supplying advice works with GEQO

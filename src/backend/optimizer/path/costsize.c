@@ -230,6 +230,34 @@ clamp_row_est(double nrows)
 }
 
 /*
+ * adjust_rel_rows_estimate
+ *		Allow a plugin to modify a row count estimate, with sanity checks.
+ *
+ * This is called after the core planner has computed rel->rows or a new
+ * ParamPathInfo's ppi_rows.  The hook may modify *rows in place.
+ * We re-apply clamp_row_est() afterward, and for parameterized estimates
+ * ensure the result does not exceed rel->rows.
+ */
+void
+adjust_rel_rows_estimate(PlannerInfo *root, RelOptInfo *rel,
+						 RelOptInfo *outer_rel, RelOptInfo *inner_rel,
+						 RelRowsEstimateKind kind, double *rows)
+{
+	if (IS_DUMMY_REL(rel) || rel_rows_estimate_hook == NULL)
+		return;
+
+	(*rel_rows_estimate_hook) (root, rel, outer_rel, inner_rel, kind, rows);
+
+	*rows = clamp_row_est(*rows);
+
+	if (kind == RELROWS_EST_PARAM_BASE || kind == RELROWS_EST_PARAM_JOIN)
+	{
+		if (*rows > rel->rows)
+			*rows = rel->rows;
+	}
+}
+
+/*
  * clamp_width_est
  *		Force a tuple-width estimate to a sane value.
  *
@@ -5506,6 +5534,9 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 
 	rel->rows = clamp_row_est(nrows);
 
+	adjust_rel_rows_estimate(root, rel, NULL, NULL,
+							 RELROWS_EST_BASE, &rel->rows);
+
 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
 
 	set_rel_width(root, rel);
@@ -5583,6 +5614,9 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 										   inner_rel->rows,
 										   sjinfo,
 										   restrictlist);
+
+	adjust_rel_rows_estimate(root, rel, outer_rel, inner_rel,
+							 RELROWS_EST_JOIN, &rel->rows);
 }
 
 /*

@@ -894,6 +894,9 @@ pgpa_walker_would_advise(pgpa_plan_walker_context *walker,
 											 relids);
 		case PGPA_TAG_NO_GATHER:
 			return pgpa_walker_contains_no_gather(walker, relids);
+		case PGPA_TAG_CARDINALITY:
+			/* CARDINALITY advice is apply-only, never generated from plans */
+			return false;
 	}
 
 	/* should not get here */

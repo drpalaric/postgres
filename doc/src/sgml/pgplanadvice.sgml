@@ -478,6 +478,56 @@ SEMIJOIN_NON_UNIQUE(<replaceable>sj_unique_item</replaceable> [ ... ])
 
   </sect3>
 
+  <sect3 id="pgplanadvice-cardinality">
+  <title>Cardinality Advice</title>
+   <synopsis>
+CARDINALITY(<replaceable>cardinality_target</replaceable> <replaceable>op</replaceable> <replaceable>number</replaceable>)
+
+<phrase>where <replaceable>cardinality_target</replaceable> is:</phrase>
+
+{ <replaceable>advice_target</replaceable> [ ... ] |
+( <replaceable>advice_target</replaceable> [ ... ] ) }
+
+<phrase>and <replaceable>op</replaceable> is one of:</phrase>
+
+{ + | - | * | / | = }</synopsis>
+
+   <para>
+    <literal>CARDINALITY</literal> advice adjusts the planner's row count
+    estimates. Unlike most other advice tags, cardinality advice is apply-only:
+    the module does not generate <literal>CARDINALITY</literal> advice from
+    existing plans.
+   </para>
+
+   <para>
+    When the target is a single relation identifier or a whitespace-separated
+    list of identifiers, the adjustment applies to each matching base-relation
+    scan estimate (and to parameterized scan estimates derived from it). For
+    example, <literal>CARDINALITY(a + 2)</literal> adds 2 to the row estimate
+    for <literal>a</literal>, and <literal>CARDINALITY(a b * 2)</literal>
+    doubles the scan estimates for <literal>a</literal> and
+    <literal>b</literal> separately.
+   </para>
+
+   <para>
+    When the target is a parenthesized list of at least two identifiers, the
+    adjustment applies to the row estimate of the lowest join rel that contains
+    exactly that set of base relations: neither join input may already contain
+    the full target set. For example, <literal>CARDINALITY((a b) * 2)</literal>
+    doubles the row estimate of the join between <literal>a</literal> and
+    <literal>b</literal>, but not the individual scan estimates.
+   </para>
+
+   <para>
+    The numeric operand may be an integer or floating-point literal. Division
+    by zero is rejected when the advice string is parsed. After adjustment,
+    row estimates are clamped to sane values. Cardinality advice does not
+    currently apply to inherited or append parents, some grouped-aggregation
+    join rels, or <literal>UNION</literal>/<literal>setop</literal> rels.
+   </para>
+
+  </sect3>
+
   <sect3 id="pgplanadvice-parallel-query">
   <title>Parallel Query Advice</title>
    <synopsis>
